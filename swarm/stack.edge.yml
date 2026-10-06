@@ -1,0 +1,70 @@
+# ===========================================================================
+# Point d'entree HTTP : FOURNI, fonctionnel, a ne pas modifier.
+#
+#   docker network create --driver overlay --attachable edge_public
+#   docker stack deploy -c swarm/stack.edge.yml edge
+#
+# Un seul port ouvert sur tout le cluster. Chaque service declare son routage
+# dans SES labels : ajouter un service ne demande aucune modification ici.
+# C'est ce qui rend le scenario 8 (ajout d'un service en soutenance) tenable.
+#
+# Ecarts assumes par rapport au fichier fourni (le routage est inchange) :
+#   1. image : v3.3 -> v3.6, tiree de notre registry (voir plus bas)
+#   2. tableau de bord : le port 8088 ouvert sans mot de passe est retire.
+#      Le cahier des charges demande UN SEUL port publie et un acces
+#      d'administration protege. Le tableau de bord passe par le port 80,
+#      sur traefik.local, derriere un mot de passe stocke en secret Swarm.
+#
+# Prerequis : le secret traefik_users (voir la procedure de deploiement).
+# ===========================================================================
+services:
+  traefik:
+    # Seule ligne modifiee du fichier fourni. Traefik v3.3 parle a Docker
+    # avec l'API 1.24, que Docker Engine 29 refuse ("client version 1.24 is
+    # too old") : aucun service n'etait decouvert, tout repondait 404.
+    # La v3.6 negocie la version. Image copiee dans notre registry.
+    image: ${REGISTRY:-registry.local:5000}/traefik:v3.6
+    command:
+      - --providers.swarm=true
+      - --providers.swarm.endpoint=unix:///var/run/docker.sock
+      - --providers.swarm.exposedByDefault=false
+      - --providers.swarm.network=edge_public
+      - --providers.swarm.refreshSeconds=10
+      - --entryPoints.web.address=:80
+      - --api.dashboard=true
+      - --accesslog=true
+      - --metrics.prometheus=true
+    ports:
+      # Le seul port publie de tout le cluster.
+      - { target: 80,   published: 80,   mode: ingress }
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    secrets: [traefik_users]
+    networks: [public]
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]   # le provider lit l'API du cluster
+      update_config: { order: start-first, failure_action: rollback }
+      labels:
+        # Le tableau de bord se route comme n'importe quel service, par le
+        # port 80, et exige un mot de passe.
+        - traefik.enable=true
+        - traefik.http.routers.dashboard.rule=Host(`traefik.local`)
+        - traefik.http.routers.dashboard.entrypoints=web
+        - traefik.http.routers.dashboard.service=api@internal
+        - traefik.http.routers.dashboard.middlewares=admin-auth
+        # Comptes lus dans le secret : aucun mot de passe dans ce fichier.
+        - traefik.http.middlewares.admin-auth.basicauth.usersfile=/run/secrets/traefik_users
+        # Exige par le provider Swarm pour tout service expose, meme si la
+        # route pointe vers l'API interne de Traefik.
+        - traefik.http.services.dashboard.loadbalancer.server.port=8080
+
+networks:
+  public:
+    driver: overlay
+    attachable: true
+
+secrets:
+  traefik_users:
+    external: true

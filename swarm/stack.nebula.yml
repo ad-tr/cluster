@@ -1,0 +1,280 @@
+# ===========================================================================
+# NEBULA : les six services derrière le point d'entrée (stack.edge.yml).
+#
+# Prérequis, sur le manager :
+#   - la stack edge est déployée (elle crée le réseau edge_public)
+#   - les secrets pg_password, bus_password et cache_password existent
+#   - docker login registry.local:5000 a réussi
+#
+# Déploiement :
+#   REGISTRY=registry.local:5000 TAG=v1 \
+#     docker stack deploy -c swarm/stack.nebula.yml --with-registry-auth nebula
+#
+# Ajouter un service : copier le bloc "comptes", changer le nom, l'image et
+# la règle de routage. Rien d'autre n'est à modifier, ni ici ni dans edge.
+# ===========================================================================
+
+# Réglages communs aux services sans état. Chaque service les reprend avec
+# "<<: *sans-etat" et n'ajoute que ce qui lui est propre.
+x-sans-etat: &sans-etat
+  placement:
+    # Les services applicatifs tournent sur les exécutants. Le gestionnaire
+    # garde ses ressources pour l'orchestration et le point d'entrée.
+    constraints: [node.role == worker]
+  update_config:
+    parallelism: 1          # une instance à la fois
+    delay: 10s              # pause entre deux instances
+    order: start-first      # la nouvelle démarre AVANT l'arrêt de l'ancienne
+    monitor: 30s            # durée d'observation après chaque remplacement
+    failure_action: rollback  # en cas d'échec, retour arrière automatique
+  rollback_config:
+    parallelism: 1
+    order: start-first
+  restart_policy:
+    condition: any          # une tâche qui s'arrête est toujours relancée
+    delay: 5s
+  resources:
+    limits:
+      memory: 256M          # au-delà, le conteneur est tué, pas la machine
+
+services:
+
+  # --- Services applicatifs (sans état) -----------------------------------
+
+  comptes:
+    image: ${REGISTRY:-registry.local:5000}/nebula-comptes:${TAG:?definir TAG, par exemple TAG=v1}
+    environment:
+      PGHOST: db
+      POSTGRES_DB: nebula
+      POSTGRES_USER: nebula
+      # Le mot de passe n'est pas ici : l'appli le lit dans le fichier monté
+      # par le secret.
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+    # Arrêt en douceur. Quand Swarm demande l'arrêt (signal TERM), l'instance
+    # continue de répondre 15 s avant de s'éteindre : Traefik ne relit la
+    # liste des instances que toutes les 10 s, et lui enverrait sinon des
+    # requêtes dans le vide (502 mesurés pendant une mise à jour).
+    command:
+      - sh
+      - -c
+      - |
+        node src/index.js &
+        pid=$$!
+        trap 'sleep 15; kill -TERM $$pid' TERM
+        wait $$pid
+        wait $$pid
+    # Doit dépasser les 15 s d'attente, sinon Swarm tue l'instance avant.
+    stop_grace_period: 30s
+    secrets: [pg_password]
+    networks: [interne, edge_public]
+    deploy:
+      <<: *sans-etat
+      replicas: 3
+      labels:
+        - traefik.enable=true
+        # Le service est sur deux réseaux : on désigne celui que Traefik
+        # emprunte, sinon une requête sur deux part dans le vide.
+        - traefik.swarm.network=edge_public
+        - traefik.http.routers.comptes.rule=Host(`nebula.local`) && PathPrefix(`/api/comptes`)
+        - traefik.http.routers.comptes.entrypoints=web
+        - traefik.http.routers.comptes.middlewares=api-strip
+        # /api/comptes côté public devient /comptes côté service.
+        - traefik.http.middlewares.api-strip.stripprefix.prefixes=/api
+        # En Swarm, Traefik ne devine pas le port : il faut le lui donner.
+        - traefik.http.services.comptes.loadbalancer.server.port=3000
+
+  publications:
+    image: ${REGISTRY:-registry.local:5000}/nebula-publications:${TAG:?definir TAG, par exemple TAG=v1}
+    environment:
+      PGHOST: db
+      POSTGRES_DB: nebula
+      POSTGRES_USER: nebula
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+      COMPTES_URL: http://comptes:3000
+    # L'appli attend les adresses du bus et du cache dans des variables, mot
+    # de passe compris. On les fabrique au démarrage à partir des secrets,
+    # pour qu'aucun mot de passe n'apparaisse dans ce fichier.
+    command:
+      - sh
+      - -c
+      - |
+        export AMQP_URL="amqp://nebula:$$(cat /run/secrets/bus_password)@bus:5672"
+        export REDIS_URL="redis://:$$(cat /run/secrets/cache_password)@cache:6379"
+        node src/index.js &
+        pid=$$!
+        trap 'sleep 15; kill -TERM $$pid' TERM
+        wait $$pid
+        wait $$pid
+    # Arrêt en douceur, même logique que pour comptes.
+    stop_grace_period: 30s
+    secrets: [pg_password, bus_password, cache_password]
+    networks: [interne, edge_public]
+    deploy:
+      <<: *sans-etat
+      replicas: 3
+      labels:
+        - traefik.enable=true
+        - traefik.swarm.network=edge_public
+        - traefik.http.routers.publications.rule=Host(`nebula.local`) && (PathPrefix(`/api/publications`) || PathPrefix(`/api/fil`) || Path(`/api/health`))
+        - traefik.http.routers.publications.entrypoints=web
+        - traefik.http.routers.publications.middlewares=api-strip
+        - traefik.http.middlewares.api-strip.stripprefix.prefixes=/api
+        - traefik.http.services.publications.loadbalancer.server.port=3000
+
+  worker-medias:
+    image: ${REGISTRY:-registry.local:5000}/nebula-worker-medias:${TAG:?definir TAG, par exemple TAG=v1}
+    environment:
+      # Les traces sont écrites dans le conteneur : elles prouvent le
+      # traitement asynchrone, ce ne sont pas des données à conserver.
+      SORTIE_DIR: /tmp/traces
+    command:
+      - sh
+      - -c
+      - |
+        export AMQP_URL="amqp://nebula:$$(cat /run/secrets/bus_password)@bus:5672"
+        exec node src/index.js
+    secrets: [bus_password]
+    # Aucune route publique : le worker ne parle qu'au bus.
+    networks: [interne]
+    deploy:
+      <<: *sans-etat
+      replicas: 2
+
+  # --- Dépendances d'infrastructure ---------------------------------------
+
+  # Les images de la base, du cache et du bus sont copiées dans notre
+  # registry : le cluster ne dépend plus de Docker Hub (quotas, coupures).
+
+  db:
+    image: ${REGISTRY:-registry.local:5000}/postgres:18-alpine
+    environment:
+      POSTGRES_DB: nebula
+      POSTGRES_USER: nebula
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+    secrets: [pg_password]
+    configs:
+      # Schéma créé au tout premier démarrage du volume, jamais ensuite.
+      - source: db_init
+        target: /docker-entrypoint-initdb.d/init.sql
+    volumes:
+      # Depuis Postgres 18, le volume se monte sur la racine, pas sur /data.
+      - db_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nebula -d nebula"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    stop_grace_period: 30s
+    networks: [interne]
+    deploy:
+      replicas: 1
+      placement:
+        # Le volume est local à une machine : la base ne doit jamais démarrer
+        # ailleurs, sinon elle repartirait d'un volume vide.
+        constraints: [node.labels.db == true]
+      update_config:
+        order: stop-first   # jamais deux Postgres sur le même volume
+      restart_policy:
+        condition: any
+        delay: 5s
+      resources:
+        limits:
+          memory: 512M
+
+  cache:
+    image: ${REGISTRY:-registry.local:5000}/redis:7-alpine
+    # Cache volatil : aucune écriture sur disque, donc rien à sauvegarder.
+    command:
+      - sh
+      - -c
+      - exec redis-server --save "" --appendonly no --requirepass "$$(cat /run/secrets/cache_password)"
+    secrets: [cache_password]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$(cat /run/secrets/cache_password)\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [interne]
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.role == worker]
+      restart_policy:
+        condition: any
+        delay: 5s
+      resources:
+        limits:
+          memory: 128M
+
+  bus:
+    image: ${REGISTRY:-registry.local:5000}/rabbitmq:4-management-alpine
+    # RabbitMQ range ses données sous le nom de sa machine : on le fixe pour
+    # qu'il retrouve ses files après un redémarrage.
+    hostname: bus
+    environment:
+      RABBITMQ_DEFAULT_USER: nebula
+    # L'image RabbitMQ 4 n'accepte plus de lire le mot de passe dans un
+    # fichier (variable ..._PASS_FILE refusée). On lit donc le secret au
+    # démarrage, puis on rend la main au lanceur normal de l'image.
+    command:
+      - sh
+      - -c
+      - |
+        export RABBITMQ_DEFAULT_PASS="$$(cat /run/secrets/bus_password)"
+        exec docker-entrypoint.sh rabbitmq-server
+    secrets: [bus_password]
+    volumes:
+      - bus_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks: [interne]
+    deploy:
+      replicas: 1
+      placement:
+        # Même logique que la base : les files sont dans un volume local.
+        constraints: [node.labels.zone == internal]
+      update_config:
+        order: stop-first
+      restart_policy:
+        condition: any
+        delay: 5s
+      resources:
+        limits:
+          memory: 512M
+
+# --- Réseaux ---------------------------------------------------------------
+
+networks:
+  # Échanges internes. "internal" coupe toute sortie vers l'extérieur : la
+  # base, le cache et le bus ne sont joignables que par les services du
+  # cluster branchés sur ce réseau.
+  interne:
+    driver: overlay
+    internal: true
+  # Réseau du point d'entrée, créé par la stack edge : on s'y branche.
+  edge_public:
+    external: true
+
+# --- Données, configurations, secrets --------------------------------------
+
+volumes:
+  db_data:
+  bus_data:
+
+configs:
+  db_init:
+    file: ../db/init.sql
+
+secrets:
+  # Créés à part, avant le déploiement. Aucune valeur n'est dans le dépôt.
+  pg_password:
+    external: true
+  bus_password:
+    external: true
+  cache_password:
+    external: true

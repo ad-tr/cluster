@@ -1,0 +1,14 @@
+# Secrets et fichiers locaux : rien de tout cela ne doit entrer dans Git.
+.env
+.env.*
+!.env.example
+auth/
+htpasswd
+*.pem
+*.key
+.docker/
+
+# Systeme et outils
+.DS_Store
+node_modules/
+*.log

@@ -1,0 +1,32 @@
+# ===========================================================================
+# Registry prive, EXTERNE au cluster Swarm : il tourne sur sa propre machine
+# (VM "registry"), avec docker compose, et n'a jamais rejoint le Swarm.
+#
+# Pourquoi externe : pour redemarrer le cluster il faut tirer les images, et
+# pour tirer les images il faudrait que le cluster tourne.
+#
+#   mkdir -p auth
+#   docker run --rm --entrypoint htpasswd httpd:2.4-alpine -Bbn nebula '<mot de passe>' > auth/htpasswd
+#   docker compose up -d
+#
+# Le dossier auth/ contient le fichier de comptes : il n'est pas versionne.
+# ===========================================================================
+name: registry
+
+services:
+  registry:
+    image: registry:3
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: "Registry Nebula"
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    volumes:
+      - registry_data:/var/lib/registry
+      - ./auth:/auth:ro
+
+volumes:
+  registry_data:
